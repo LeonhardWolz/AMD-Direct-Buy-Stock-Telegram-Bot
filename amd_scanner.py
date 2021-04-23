@@ -7,12 +7,13 @@ import sys
 import threading
 import time
 import yaml
+import logging
 from signal import SIGINT, signal
 
 import requests
 from bs4 import BeautifulSoup
 from telegram import Bot
-from telegram.ext import CommandHandler, Filters, MessageHandler, Updater
+from telegram.ext import CommandHandler, CallbackContext, Filters, MessageHandler, Updater
 from telegram.utils.request import Request
 
 CREATE_USERS_TABLE = """CREATE TABLE IF NOT EXISTS connected_users (
@@ -25,6 +26,8 @@ CREATE_LISTED_PRODUCTS_TABLE = """CREATE TABLE IF NOT EXISTS listed_products (
     product_page text,
     available integer);"""
 
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class BotHandler(object):
     AMD_URL = "https://www.amd.com/de/direct-buy/de"
@@ -43,6 +46,7 @@ class BotHandler(object):
     def __init__(self, db_conn, bot_token):
         self.db_conn = db_conn
         self.bot_token = bot_token
+        self.logger = logging.getLogger(__name__)
         
         self.bot_start()
     
@@ -71,11 +75,16 @@ class BotHandler(object):
         dispatcher.add_handler(CommandHandler("help", self.help))
         dispatcher.add_handler(CommandHandler("current", self.current))
 
+        dispatcher.add_error_handler(self.error_handler)
+
         dispatcher.run_async(self.scan_sites, bot)
 
         updater.start_polling()
 
         updater.idle()
+    
+    def error_handler(self, update, context):
+        self.logger.error(msg="Exception while handling an update: ", exc_info=context.error)
 
     def start(self, update, context):
         update.message.reply_text("Hello. I am the Amd Direct Buy stock notifier bot. I will provide notifications when "
@@ -150,41 +159,50 @@ class BotHandler(object):
     def scan_sites(self, bot):
 
         while True:
-            last_stock = self.last_stock
-
-            page = requests.get(self.AMD_URL, headers=self.HTTP_HEADERS, timeout=5)
-            soup = BeautifulSoup(page.content, "html.parser")
-
-            shop_items = soup.find_all("div", class_="shop-content")
-
-            current_stock = self.extract_current_stock(shop_items)
-
-            # dict of new products
-            new_products = {k: v for (k, v) in current_stock.items() if k not in last_stock}
-
-            # dict of new and old products that are available
-            new_available_products = {k: v for (k, v) in current_stock.items() if (k not in last_stock and v[2]) or (k in last_stock and v[2] > last_stock[k][2])}
-
-            # dict of new and old products that are not available
-            new_unavailable_products = {k: v for (k, v) in current_stock.items() if (k not in last_stock and not v[2]) or (k in last_stock and v[2] < last_stock[k][2])}
-
-            # dict of products no longer listed on the page
-            dropped_products = {k: v for (k, v) in last_stock.items() if k not in current_stock}
-
-            # dict of products with updated price
-            changed_price = {k: v for (k, v) in current_stock.items() if k in last_stock and v[0] != last_stock[k][0]}
-
-            # send bot message and update db if site changed
-            if new_products or new_available_products or new_unavailable_products or dropped_products or changed_price:
-                self.bot_send_message(bot, self.generate_bot_message(new_products, bot_message, new_available_products, new_unavailable_products, dropped_products, changed_price, last_stock, current_stock))
-
-                self.update_database(new_products, 
-                                    dropped_products, 
-                                    new_available_products, 
-                                    new_unavailable_products, 
-                                    changed_price)
+            page = None
+            try:
+                page = requests.get(self.AMD_URL, headers=self.HTTP_HEADERS, timeout=5)
+            except requests.exceptions.RequestException as e:
+                self.logger.exception("Exception during page request:", exc_info=True)
+            
+            if page:
+                self.process_page(page, bot)
 
             time.sleep(self.SCAN_INTERVAL)
+
+    def process_page(self, page, bot):
+        """Reads webpage and processes contents"""
+        soup = BeautifulSoup(page.content, "html.parser")
+
+        shop_items = soup.find_all("div", class_="shop-content")
+
+        current_stock = self.extract_current_stock(shop_items)
+        
+        last_stock = self.last_stock
+        # dict of new products
+        new_products = {k: v for (k, v) in current_stock.items() if k not in last_stock}
+
+        # dict of new and old products that are available
+        new_available_products = {k: v for (k, v) in current_stock.items() if (k not in last_stock and v[2]) or (k in last_stock and v[2] > last_stock[k][2])}
+
+        # dict of new and old products that are not available
+        new_unavailable_products = {k: v for (k, v) in current_stock.items() if (k not in last_stock and not v[2]) or (k in last_stock and v[2] < last_stock[k][2])}
+
+        # dict of products no longer listed on the page
+        dropped_products = {k: v for (k, v) in last_stock.items() if k not in current_stock}
+
+        # dict of products with updated price
+        changed_price = {k: v for (k, v) in current_stock.items() if k in last_stock and v[0] != last_stock[k][0]}
+
+        # send bot message and update db if site changed
+        if new_products or new_available_products or new_unavailable_products or dropped_products or changed_price:
+            self.bot_send_message(bot, self.generate_bot_message(new_products, new_available_products, new_unavailable_products, dropped_products, changed_price, last_stock, current_stock))
+
+            self.update_database(new_products, 
+                                dropped_products, 
+                                new_available_products, 
+                                new_unavailable_products, 
+                                changed_price)
 
     def extract_current_stock(self, shop_items):
         current_stock = {}
