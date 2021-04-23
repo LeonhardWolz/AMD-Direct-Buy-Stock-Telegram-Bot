@@ -1,0 +1,1 @@
+This is the AMD Direct Buy Stock Notifier Telegram Bot. You can find it [here](https://t.me/stock_notifier_bot).
